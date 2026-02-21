@@ -23,7 +23,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 2. Telegram 通知函式 ---
+# --- 2. Telegram 通知 ---
 def send_telegram_msg(sym, action, reason, price, p_change, v_ratio):
     try:
         token = st.secrets["TELEGRAM_BOT_TOKEN"]
@@ -41,7 +41,7 @@ def send_telegram_msg(sym, action, reason, price, p_change, v_ratio):
     except Exception as e:
         st.error(f"Telegram 發送失敗: {e}")
 
-# --- 3. 數據獲取與指標計算 ---
+# --- 3. 數據獲取 ---
 def fetch_data(symbol, p, i):
     try:
         df = yf.download(symbol, period=p, interval=i, progress=False)
@@ -64,91 +64,93 @@ def fetch_data(symbol, p, i):
         return df
     except: return None
 
-# --- 4. 信號判定與理由生成 ---
-def get_signal(df, p_limit, v_limit, sym, use_breakout):
-    if len(df) < 7: return "⏳ 載入中", "#aaaaaa", "數據不足", False, ""
+# --- 4. 信號判定 (含 5K 突破與 MACD 翻轉) ---
+def get_signal(df, p_limit, v_limit, sym, use_breakout, use_macd_flip):
+    if len(df) < 10: return "⏳ 載入中", "#aaaaaa", "數據不足", False, ""
     
     last = df.iloc[-1]
     prev = df.iloc[-2]
     price = float(last['Close'])
-    ema20, ema60, ema200 = float(last['EMA20']), float(last['EMA60']), float(last['EMA200'])
-    
-    # 趨勢與量價判定
-    is_bullish_trend = price > ema200 and ema20 > ema60
-    is_bearish_trend = price < ema200 and ema20 < ema60
     p_change = ((price - float(prev['Close'])) / float(prev['Close'])) * 100
     v_ratio = float(last['Volume']) / float(last['Vol_Avg']) if last['Vol_Avg'] > 0 else 1
     
-    # 基本策略達成
-    base_bull = is_bullish_trend and p_change >= p_limit and v_ratio >= v_limit
-    base_bear = is_bearish_trend and p_change <= -p_limit and v_ratio >= v_limit
+    # [1] 均線量價邏輯
+    is_bull_trend = price > last['EMA200'] and last['EMA20'] > last['EMA60']
+    is_bear_trend = price < last['EMA200'] and last['EMA20'] < last['EMA60']
+    base_bull = is_bull_trend and p_change >= p_limit and v_ratio >= v_limit
+    base_bear = is_bear_trend and p_change <= -p_limit and v_ratio >= v_limit
 
-    # 突破前5根K線邏輯
-    is_break_high = False
-    is_break_low = False
+    # [2] 5K 突破邏輯
+    is_break_high, is_break_low = False, False
     if use_breakout:
-        prev_5_candles = df.iloc[-6:-1]
-        max_high_5 = prev_5_candles['High'].max()
-        min_low_5 = prev_5_candles['Low'].min()
-        is_break_high = price > max_high_5
-        is_break_low = price < min_low_5
+        max_h5 = df.iloc[-6:-1]['High'].max()
+        min_l5 = df.iloc[-6:-1]['Low'].min()
+        is_break_high = price > max_h5
+        is_break_low = price < min_l5
+
+    # [3] MACD 翻轉邏輯 (NEW)
+    macd_bull_flip, macd_bear_flip = False, False
+    if use_macd_flip and len(df) >= 8:
+        hist_window = df['Hist'].iloc[-8:].values
+        # 7根負轉1根正
+        macd_bull_flip = all(x < 0 for x in hist_window[:-1]) and hist_window[-1] > 0
+        # 7根正轉1根負
+        macd_bear_flip = all(x > 0 for x in hist_window[:-1]) and hist_window[-1] < 0
 
     trigger_alert = False
     action_type = ""
     reasons = []
     card_style = ""
 
-    # 做多判斷 (OR 邏輯)
-    if base_bull or (use_breakout and is_break_high):
+    # 綜合做多判斷
+    if base_bull or (use_breakout and is_break_high) or macd_bull_flip:
         trigger_alert, action_type, card_style = True, "🚀 強勢做多", "blink-bull"
-        if base_bull:
-            reasons.extend([f"✅ 均線多頭趨勢", f"✅ 漲幅 {p_change:.2f}%", f"✅ 放量 {v_ratio:.1f}x"])
-        if use_breakout and is_break_high:
-            reasons.append(f"🔥 突破前5K高點 ({max_high_5:.2f})")
+        if base_bull: reasons.append("✅ 趨勢量價達標")
+        if is_break_high: reasons.append(f"🔥 突破前5K高點")
+        if macd_bull_flip: reasons.append("🌈 MACD柱狀圖: 7負轉1正")
 
-    # 做空判斷 (OR 邏輯)
-    elif base_bear or (use_breakout and is_break_low):
+    # 綜合做空判斷
+    elif base_bear or (use_breakout and is_break_low) or macd_bear_flip:
         trigger_alert, action_type, card_style = True, "🔻 強勢做空", "blink-bear"
-        if base_bear:
-            reasons.extend([f"❌ 均線空頭趨勢", f"❌ 跌幅 {p_change:.2f}%", f"❌ 放量 {v_ratio:.1f}x"])
-        if use_breakout and is_break_low:
-            reasons.append(f"📉 跌破前5K低點 ({min_low_5:.2f})")
+        if base_bear: reasons.append("❌ 趨勢量價達標")
+        if is_break_low: reasons.append(f"📉 跌破前5K低點")
+        if macd_bear_flip: reasons.append("🌊 MACD柱狀圖: 7正轉1負")
 
     if trigger_alert:
         send_telegram_msg(sym, action_type, "\n".join(reasons), price, p_change, v_ratio)
 
-    # UI 顯示狀態
-    status, color = ("🚀 做多", "#00ff00") if is_bullish_trend else ("🔻 做空", "#ff4b4b") if is_bearish_trend else ("⚖️ 觀望", "#aaaaaa")
+    # UI 顯示
+    status, color = ("🚀 做多", "#00ff00") if is_bull_trend else ("🔻 做空", "#ff4b4b") if is_bear_trend else ("⚖️ 觀望", "#aaaaaa")
     if action_type: status = action_type
 
     alert_msgs = []
     if abs(p_change) >= p_limit: alert_msgs.append(f"⚠️ 價異: {p_change:+.2f}%")
     if v_ratio >= v_limit: alert_msgs.append(f"🔥 量爆: {v_ratio:.1f}x")
-    if use_breakout and is_break_high: alert_msgs.append("📈 創5K新高")
-    if use_breakout and is_break_low: alert_msgs.append("📉 破5K新低")
+    if is_break_high: alert_msgs.append("📈 創5K高")
+    if is_break_low: alert_msgs.append("📉 破5K低")
+    if macd_bull_flip or macd_bear_flip: alert_msgs.append("⚡ MACD翻轉")
     
     return status, color, "<br>".join(alert_msgs) if alert_msgs else "正常", card_style
 
 # --- 5. 側邊欄配置 ---
 with st.sidebar:
     st.header("⚙️ 參數設定")
-    input_symbols = st.text_input("股票代碼 (逗號分隔)", value="TSLA, NIO, TSLL, XPEV, META, GOOGL, AAPL, NVDA, AMZN, MSFT, TSM, BTC-USD").upper()
+    input_symbols = st.text_input("股票代碼", value="TSLA, NIO, TSLL, XPEV, META, GOOGL, AAPL, NVDA, AMZN, MSFT, TSM, BTC-USD").upper()
     symbols = [s.strip() for s in input_symbols.split(",") if s.strip()]
-    
     c1, c2 = st.columns(2)
     with c1: sel_period = st.selectbox("範圍", ["1d", "5d", "1mo", "1y"], index=1)
     with c2: sel_interval = st.selectbox("週期", ["1m", "5m", "15m", "1h", "1d"], index=1)
-        
     refresh_rate = st.slider("刷新頻率 (秒)", 60, 600, 300)
     
     st.divider()
     vol_threshold = st.number_input("成交量異常倍數", value=2.0, step=0.5)
     price_threshold = st.number_input("股價單根異動 (%)", value=1.0, step=0.1)
     
-    # 突破功能開關 (改為 OR 邏輯說明)
-    use_breakout = st.checkbox("加入 5K 突破監控", value=False, help="開啟後，滿足『均線量價異動』或『突破前5根K線高/低點』任一條件即觸發預警。")
+    # 功能開關
+    use_breakout = st.checkbox("5K 突破監控", value=False)
+    use_macd_flip = st.checkbox("MACD 7+1 反轉監控", value=False)
 
-# --- 6. 主介面循環 ---
+# --- 6. 主介面 ---
 st.title("📈 智能監控與 Telegram 預警系統")
 placeholder = st.empty()
 
@@ -162,32 +164,30 @@ while True:
                 df = fetch_data(sym, sel_period, sel_interval)
                 if df is not None:
                     all_data[sym] = df
-                    status, color, alert_msg, card_style = get_signal(df, price_threshold, vol_threshold, sym, use_breakout)
-                    
+                    status, color, alert_msg, card_style = get_signal(df, price_threshold, vol_threshold, sym, use_breakout, use_macd_flip)
                     cols[i].markdown(f"""
                         <div class='{card_style}' style='border:1px solid #444; padding:15px; border-radius:10px; text-align:center;'>
                             <h3 style='margin:0;'>{sym}</h3>
                             <h2 style='color:{color}; margin:10px 0;'>{status}</h2>
                             <p style='font-size:1.3em; margin:0;'><b>{df['Close'].iloc[-1]:.2f}</b></p>
                             <hr style='margin:10px 0; border:0.5px solid #333;'>
-                            <p style='font-size:0.9em; color:#ffa500;'>{alert_msg}</p>
+                            <p style='font-size:0.8em; color:#ffa500;'>{alert_msg}</p>
                         </div>
                     """, unsafe_allow_html=True)
-
         st.divider()
         if all_data:
             tabs = st.tabs(list(all_data.keys()))
             for i, (sym, df) in enumerate(all_data.items()):
                 with tabs[i]:
-                    plot_df = df.tail(30).copy()
+                    plot_df = df.tail(35).copy()
                     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
                     fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name='K線'), row=1, col=1)
                     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA20'], name='EMA20', line=dict(color='yellow', width=1)), row=1, col=1)
                     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA200'], name='EMA200', line=dict(color='red', width=1.5)), row=1, col=1)
-                    fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['Hist'], name='MACD Hist', marker_color='orange'), row=2, col=1)
+                    # MACD 柱狀圖顏色優化
+                    colors = ['#00ff00' if x >= 0 else '#ff4b4b' for x in plot_df['Hist']]
+                    fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['Hist'], name='MACD Hist', marker_color=colors), row=2, col=1)
                     fig.update_layout(height=500, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=10,r=10,t=10,b=10))
                     st.plotly_chart(fig, use_container_width=True, key=f"fig_{sym}")
-
-        st.caption(f"📅 最後更新: {datetime.now().strftime('%H:%M:%S')} | 模式: {sel_interval}")
-
+        st.caption(f"📅 更新: {datetime.now().strftime('%H:%M:%S')}")
     time.sleep(refresh_rate)
