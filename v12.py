@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 import time
 import requests
+import re
 
 # --- 1. 頁面配置與 CSS ---
 st.set_page_config(page_title="多股實時監控系統", layout="wide")
@@ -49,13 +50,11 @@ def fetch_data(symbol, p, i):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.loc[:, ~df.columns.duplicated()].copy()
-        
         close = df['Close'].squeeze()
         df['EMA20'] = close.ewm(span=20, adjust=False).mean()
         df['EMA60'] = close.ewm(span=60, adjust=False).mean()
         df['EMA200'] = close.ewm(span=200, adjust=False).mean()
         df['Vol_Avg'] = df['Volume'].rolling(window=20).mean()
-        
         ema12 = close.ewm(span=12, adjust=False).mean()
         ema26 = close.ewm(span=26, adjust=False).mean()
         df['MACD'] = ema12 - ema26
@@ -64,8 +63,25 @@ def fetch_data(symbol, p, i):
         return df
     except: return None
 
-# --- 4. 信號判定 (含 5K 突破與 MACD 翻轉) ---
-def get_signal(df, p_limit, v_limit, sym, use_breakout, use_macd_flip):
+# --- 4. 價格水平預警解析與判定 ---
+def check_custom_alerts(sym, price, alert_str):
+    # 支援格式: TSLA>420, AAPL<150 (逗號或換行分隔)
+    alerts = re.split(r'[,\n]', alert_str)
+    for a in alerts:
+        a = a.strip().upper()
+        if not a: continue
+        # 解析 "代碼>價格" 或 "代碼升穿價格" 等邏輯
+        match = re.search(rf"{sym}\s*([><]|升穿|跌穿)\s*(\d+\.?\d*)", a)
+        if match:
+            op = match.group(1)
+            target_price = float(match.group(2))
+            if (op in ['>', '升穿'] and price >= target_price) or \
+               (op in ['<', '跌穿'] and price <= target_price):
+                return True, f"🎯 自定義價格預警: {a} (現價:{price:.2f})"
+    return False, ""
+
+# --- 5. 綜合信號判定 ---
+def get_signal(df, p_limit, v_limit, sym, use_breakout, use_macd_flip, custom_alert_input):
     if len(df) < 10: return "⏳ 載入中", "#aaaaaa", "數據不足", False, ""
     
     last = df.iloc[-1]
@@ -74,65 +90,68 @@ def get_signal(df, p_limit, v_limit, sym, use_breakout, use_macd_flip):
     p_change = ((price - float(prev['Close'])) / float(prev['Close'])) * 100
     v_ratio = float(last['Volume']) / float(last['Vol_Avg']) if last['Vol_Avg'] > 0 else 1
     
-    # [1] 均線量價邏輯
+    reasons = []
+    trigger_alert = False
+    action_type = ""
+    card_style = ""
+
+    # [1] 自定義價格水平監控 (優先觸發)
+    hit_custom, custom_reason = check_custom_alerts(sym, price, custom_alert_input)
+    if hit_custom:
+        trigger_alert, action_type, card_style = True, "🎯 價格觸達", "blink-bull" if p_change > 0 else "blink-bear"
+        reasons.append(custom_reason)
+
+    # [2] 均線量價/5K突破/MACD翻轉邏輯
     is_bull_trend = price > last['EMA200'] and last['EMA20'] > last['EMA60']
     is_bear_trend = price < last['EMA200'] and last['EMA20'] < last['EMA60']
+    
+    # 判斷各種子條件
     base_bull = is_bull_trend and p_change >= p_limit and v_ratio >= v_limit
     base_bear = is_bear_trend and p_change <= -p_limit and v_ratio >= v_limit
-
-    # [2] 5K 突破邏輯
+    
     is_break_high, is_break_low = False, False
     if use_breakout:
-        max_h5 = df.iloc[-6:-1]['High'].max()
-        min_l5 = df.iloc[-6:-1]['Low'].min()
-        is_break_high = price > max_h5
-        is_break_low = price < min_l5
+        max_h5 = df.iloc[-6:-1]['High'].max(); min_l5 = df.iloc[-6:-1]['Low'].min()
+        is_break_high, is_break_low = price > max_h5, price < min_l5
 
-    # [3] MACD 翻轉邏輯 (NEW)
     macd_bull_flip, macd_bear_flip = False, False
     if use_macd_flip and len(df) >= 8:
         hist_window = df['Hist'].iloc[-8:].values
-        # 7根負轉1根正
         macd_bull_flip = all(x < 0 for x in hist_window[:-1]) and hist_window[-1] > 0
-        # 7根正轉1根負
         macd_bear_flip = all(x > 0 for x in hist_window[:-1]) and hist_window[-1] < 0
 
-    trigger_alert = False
-    action_type = ""
-    reasons = []
-    card_style = ""
-
-    # 綜合做多判斷
+    # 彙整預警 (做多類)
     if base_bull or (use_breakout and is_break_high) or macd_bull_flip:
-        trigger_alert, action_type, card_style = True, "🚀 強勢做多", "blink-bull"
+        trigger_alert, action_type = True, "🚀 強勢做多"
+        card_style = "blink-bull"
         if base_bull: reasons.append("✅ 趨勢量價達標")
-        if is_break_high: reasons.append(f"🔥 突破前5K高點")
-        if macd_bull_flip: reasons.append("🌈 MACD柱狀圖: 7負轉1正")
+        if is_break_high: reasons.append("🔥 突破前5K高點")
+        if macd_bull_flip: reasons.append("🌈 MACD: 7負轉1正")
 
-    # 綜合做空判斷
+    # 彙整預警 (做空類)
     elif base_bear or (use_breakout and is_break_low) or macd_bear_flip:
-        trigger_alert, action_type, card_style = True, "🔻 強勢做空", "blink-bear"
+        trigger_alert, action_type = True, "🔻 強勢做空"
+        card_style = "blink-bear"
         if base_bear: reasons.append("❌ 趨勢量價達標")
-        if is_break_low: reasons.append(f"📉 跌破前5K低點")
-        if macd_bear_flip: reasons.append("🌊 MACD柱狀圖: 7正轉1負")
+        if is_break_low: reasons.append("📉 跌破前5K低點")
+        if macd_bear_flip: reasons.append("Waves MACD: 7正轉1負")
 
     if trigger_alert:
         send_telegram_msg(sym, action_type, "\n".join(reasons), price, p_change, v_ratio)
 
-    # UI 顯示
     status, color = ("🚀 做多", "#00ff00") if is_bull_trend else ("🔻 做空", "#ff4b4b") if is_bear_trend else ("⚖️ 觀望", "#aaaaaa")
     if action_type: status = action_type
 
     alert_msgs = []
+    if hit_custom: alert_msgs.append("🎯 價格達標")
     if abs(p_change) >= p_limit: alert_msgs.append(f"⚠️ 價異: {p_change:+.2f}%")
     if v_ratio >= v_limit: alert_msgs.append(f"🔥 量爆: {v_ratio:.1f}x")
-    if is_break_high: alert_msgs.append("📈 創5K高")
-    if is_break_low: alert_msgs.append("📉 破5K低")
+    if is_break_high or is_break_low: alert_msgs.append("📈 5K突破")
     if macd_bull_flip or macd_bear_flip: alert_msgs.append("⚡ MACD翻轉")
     
     return status, color, "<br>".join(alert_msgs) if alert_msgs else "正常", card_style
 
-# --- 5. 側邊欄配置 ---
+# --- 6. 側邊欄配置 ---
 with st.sidebar:
     st.header("⚙️ 參數設定")
     input_symbols = st.text_input("股票代碼", value="TSLA, NIO, TSLL, XPEV, META, GOOGL, AAPL, NVDA, AMZN, MSFT, TSM, BTC-USD").upper()
@@ -143,14 +162,17 @@ with st.sidebar:
     refresh_rate = st.slider("刷新頻率 (秒)", 60, 600, 300)
     
     st.divider()
+    # 新功能：自定義價格預警區 (NEW)
+    st.subheader("🎯 自定義價格預警")
+    custom_alert_input = st.text_area("格式: 代碼 升穿/跌穿 價格\n(如: TSLA 升穿 420)", value="", placeholder="TSLA 升穿 420\nAAPL 跌穿 200")
+    
+    st.divider()
     vol_threshold = st.number_input("成交量異常倍數", value=2.0, step=0.5)
     price_threshold = st.number_input("股價單根異動 (%)", value=1.0, step=0.1)
-    
-    # 功能開關
     use_breakout = st.checkbox("5K 突破監控", value=False)
     use_macd_flip = st.checkbox("MACD 7+1 反轉監控", value=False)
 
-# --- 6. 主介面 ---
+# --- 7. 主介面 ---
 st.title("📈 智能監控與 Telegram 預警系統")
 placeholder = st.empty()
 
@@ -164,7 +186,8 @@ while True:
                 df = fetch_data(sym, sel_period, sel_interval)
                 if df is not None:
                     all_data[sym] = df
-                    status, color, alert_msg, card_style = get_signal(df, price_threshold, vol_threshold, sym, use_breakout, use_macd_flip)
+                    # 傳入自定義預警參數 (MODIFIED)
+                    status, color, alert_msg, card_style = get_signal(df, price_threshold, vol_threshold, sym, use_breakout, use_macd_flip, custom_alert_input)
                     cols[i].markdown(f"""
                         <div class='{card_style}' style='border:1px solid #444; padding:15px; border-radius:10px; text-align:center;'>
                             <h3 style='margin:0;'>{sym}</h3>
@@ -184,7 +207,6 @@ while True:
                     fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name='K線'), row=1, col=1)
                     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA20'], name='EMA20', line=dict(color='yellow', width=1)), row=1, col=1)
                     fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['EMA200'], name='EMA200', line=dict(color='red', width=1.5)), row=1, col=1)
-                    # MACD 柱狀圖顏色優化
                     colors = ['#00ff00' if x >= 0 else '#ff4b4b' for x in plot_df['Hist']]
                     fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['Hist'], name='MACD Hist', marker_color=colors), row=2, col=1)
                     fig.update_layout(height=500, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=10,r=10,t=10,b=10))
